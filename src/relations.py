@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from abc import ABC
+from abc import ABC, abstractmethod
+from itertools import repeat, product
 from typing import Iterable, Any, Callable
 
-from more_itertools import unique_everseen
+from more_itertools import unique_everseen, bucket
 
 
 class IName:
@@ -29,6 +30,9 @@ class ISet:
 	def set(self):
 		return set(self._set)
 
+	def get_members(self) -> set:
+		return self.set
+
 
 class IArity:
 	def __init__(self, arity, **kwargs):
@@ -50,8 +54,15 @@ class IIsMatchedBy(ABC):
 
 class Relation(IName, IIsMatchedBy, ISet, IArity):
 
+	_all_relations: dict[int, list[Relation]] = {}
+
 	def __init__(self, name: str = '', arity: int = 2,  **kwargs):
 		super().__init__(name=name, arity=arity, **kwargs)
+		self._save_relation(self)
+
+	@classmethod
+	def _save_relation(cls, relation: Relation):
+		cls._all_relations.setdefault(relation.arity, []).append(relation)
 
 	def add(self, *to_adds: Any):
 		for to_add in to_adds:
@@ -63,11 +74,11 @@ class Relation(IName, IIsMatchedBy, ISet, IArity):
 		if len(elems) != self.arity:
 			return False
 		if self.arity == 1:
-			return tuple(elems) in map(tuple, self._set)
-		return elems in self._set
+			elems = tuple(elems)
+		return elems in self.set
 
 	def get_all_with_value_at(self, value: Any, n: int, from_set=None):
-		from_set = from_set or self._set
+		from_set = from_set or self.set
 		return self.get_all_with_value_at_from(value, n, from_set)
 
 	@classmethod
@@ -83,82 +94,106 @@ class Relation(IName, IIsMatchedBy, ISet, IArity):
 	def __call__(self, *args, **kwargs):
 		if len(args) == self.arity and not any((isinstance(arg, int) or arg == '*' for arg in args)):
 			return self.is_matched_by(*args)
-		return DerivedRelation(self, *args)
+		return DerivedRelation(self.name, relations=self, params=(args,))
 
+	def __or__(self, relation) -> DerivedRelation:
+		return UnionRelation(f'{self.name}_or_{relation.name}', relations=(self, relation))
 
-	# def __or__(self, relation) -> RelationBuilder:
-	# 	return UnionRelationBuilder(f'{self.name}_or_{relation.name}', self, relation)
-	#
-	# def __and__(self, relation) -> RelationBuilder:
-	# 	return IntersectionRelation(f'{self.name}_and_{relation.name}', self, relation)
-	#
-	# def __neg__(self) -> RelationBuilder:
-	# 	return ComplementRelation(f'not_{self.name}', self)
+	def __and__(self, relation) -> DerivedRelation:
+		return IntersectionRelation(f'{self.name}_and_{relation.name}', relations=(self, relation))
+
+	def __neg__(self) -> DerivedRelation:
+		return ComplementRelation(f'not_{self.name}', relation=self)
 
 
 class DerivedRelation(Relation, ABC):
-	def __init__(self, name, relations: Iterable[Relation], relations_args: list[tuple[int | str]], merge_op: Callable[[Iterable[set[tuple]]], set[tuple]] = None, **kwargs):
+	def __init__(self, name, *, relations: Iterable[Relation], params: Iterable[tuple[int | str, ...]] = None, pred: Callable[[Iterable[Relation], Iterable[tuple]], bool] = None, **kwargs):
 		self._relations = tuple(relations)
-		self._relations_args: list[tuple[int | str]] = list(relations_args)
-		self._param_indices = set(arg for args in self._relations_args for arg in args if isinstance(arg, int))
-		self._merge_op = merge_op
-		super().__init__(name=name, arity=len(self._param_indices), **kwargs)
+		self._params: list[tuple[str | int, ...]] = list(params or (tuple(range(relation.arity)) for relation in self._relations))
+		self._correspondences_with_points = self._get_correspondences_with_point()
+		self._pred = pred or self._predicate
+		super().__init__(name=name, arity=len(self._correspondences_with_points), **kwargs)
+
+	def _get_correspondences_with_point(self) -> dict[int, tuple[int, int]]:
+		result = {}
+		for relation_i, params in enumerate(self._params):
+			for member_i, correspondence in enumerate(params):
+				if isinstance(correspondence, int):
+					result.setdefault(correspondence, []).append((relation_i, member_i))
+		return result
+
+	@classmethod
+	@abstractmethod
+	def _predicate(cls, relations: Iterable[Relation], layer: Iterable[tuple]) -> bool:
+		raise NotImplementedError
 
 	@property
 	def set(self):
 		if len(self._relations) > 1:
 			raise NotImplementedError
 
-		change_count_and_all_elems_pairs = (self._decrease_arity(relation.set, args) for relation, args in zip(self._relations, self._relations_args))
-		# for index in self._param_indices:
-
-		# TODO
-
-		reordered = self._reorder_params(with_decreased_arity)
+		spaces = map(Relation.get_members, self._relations)
+		right_values_spaces = self._filter_wrong_values_out(spaces)
+		relations_members_layers = product(*list(right_values_spaces))
+		corresponding_relations_members_layers = self._filter_not_corresponding_out(relations_members_layers)
+		predicated = filter(self._pred, corresponding_relations_members_layers)
+		reordered = self._reorder_params(predicated)
 		return reordered
 
-	def _decrease_arity(self, all_elems: Iterable[tuple], args: tuple[int | str, ...]) -> tuple[int, Iterable[tuple]]:
-		change_count = 0
-		for arg_i, arg in enumerate(args):
-			i = arg_i - change_count
-			if arg == '*':
-				all_elems = self._get_without_ith_elem(all_elems, i)
-				change_count += 1
-			elif not isinstance(arg, int):
-				all_elems = self._get_without_ith_elem_with_no_other_value(all_elems, i, arg)
-				change_count += 1
-		return change_count, all_elems
+	def _filter_not_corresponding_out(self, relations_members_layers: Iterable[tuple[tuple]]) -> Iterable[tuple[tuple]]:
+		return filter(self.has_correspondent_members_the_same, relations_members_layers)
 
-	def _get_without_ith_elem(self, all_elems: Iterable[tuple], i) -> Iterable[tuple]:
-		return unique_everseen((tuple(elems[:i] + elems[i+1:]) for elems in all_elems))
+	def has_correspondent_members_the_same(self, relations_members: tuple[tuple]) -> bool:
+		for correspondence, points in self._correspondences_with_points.items():
+			correspondent_members = map(lambda p: relations_members[p[0]][p[1]], points)
+			is_same = len(set(correspondent_members)) == 1
+			if not is_same:
+				return False
+		return True
 
-	def _get_without_ith_elem_with_no_other_value(self, all_elems: Iterable[tuple], i, value) -> Iterable[tuple]:
-		return unique_everseen((tuple(elems[:i] + elems[i+1:]) for elems in all_elems if elems[i] == value))
+	def _filter_wrong_values_out(self, spaces: Iterable[Iterable[tuple]]) -> Iterable[Iterable[tuple]]:
+		return (self._filter_wrong_values_out_of_space(space, params) for space, params in zip(spaces, self._params))
 
-	def _reorder_params(self, all_elems: Iterable[tuple]) -> Iterable[tuple]:
-		lacking_count = len(self._param_indices)
-		for elems in all_elems:
-			reordered = [elems[index] for index in self._param_indices]
-			lacking = elems[lacking_count+1:]
+	def _filter_wrong_values_out_of_space(self, space: Iterable[tuple], params: tuple) -> Iterable[tuple]:
+		for param_i, param in enumerate(params):
+			if isinstance(param, str) and param != '*':
+				space = filter(lambda members: members[param_i] == param, space)
+		return space
+
+	def _reorder_params(self, space: Iterable[tuple]) -> Iterable[tuple]:
+		lacking_count = len(self._correspondences_with_points)
+		for members in space:
+			reordered = [members[index] for index in self._correspondences_with_points.keys()]
+			lacking = members[lacking_count+1:]
 			yield tuple(reordered + lacking)
 
-# class UnionRelation(ComplexRelation):
-#
-# 	def __init__(self):
-#
-# 	def is_matched_by(self, *elems: Any) -> bool:
-# 		return any(map(lambda r: r.is_matched_by(elems), self._relations))
 
-#
-# class IntersectionRelation(RelationBuilder):
-# 	def is_matched_by(self, *elems: Any) -> bool:
-# 		return all(map(lambda r: r.is_matched_by(elems), self._relations))
-#
-#
-# class ComplementRelation(RelationBuilder):
-# 	def is_matched_by(self, *elems: Any) -> bool:
-# 		relation = self._relations[0]
-# 		return elems not in relation.set
+class UnionRelation(DerivedRelation):
+	def __init__(self, name, *, relations: Iterable[Relation], params: Iterable[tuple[int | str, ...]] = None, **kwargs):
+		super().__init__(name, relations=relations, params=params, **kwargs)
+
+	@classmethod
+	def _predicate(cls, relations: Iterable[Relation], layer: Iterable[tuple]) -> bool:
+		return any((relation(members) for relation, members in zip(relations, layer)))
+
+
+class IntersectionRelation(DerivedRelation):
+	def __init__(self, name, *, relations: Iterable[Relation], params: Iterable[tuple[int | str, ...]] = None, **kwargs):
+		super().__init__(name, relations=relations, params=params, **kwargs)
+
+	@classmethod
+	def _predicate(cls, relations: Iterable[Relation], layer: Iterable[tuple]) -> bool:
+		return all((relation(members) for relation, members in zip(relations, layer)))
+
+
+class ComplementRelation(DerivedRelation):
+	def __init__(self, name, *, relation: Relation, params: tuple[int | str, ...] = None, **kwargs):
+		super().__init__(name, relations=(relation, ), params=(params,) if params else None, **kwargs)
+
+	@classmethod
+	def _predicate(cls, relations: Iterable[Relation], layer: Iterable[tuple]) -> bool:
+		relation, members = next(iter(relations)), next(iter(layer))
+		return not relation(members)
 
 
 class IInduce(ABC):
@@ -302,28 +337,30 @@ class BinaryRelation(Relation, Restrictions, CanAll):
 		induction = map(lambda p: p.induce(a, b, self._set), present_properties)
 		return any(induction)
 
-	# def __mul__(self, relation):
-	# 	return CompositionRelation(f'{self.name}_x_and_x_{relation.name}', self, relation)
-	#
-	# def __invert__(self):
-	# 	return ConverseRelation(name=f'converse_of_{self.name}', relation=self)
+	def __mul__(self, relation):
+		return CompositionRelation(f'{self.name}_x_and_x_{relation.name}', relations=(self, relation))
 
-#
-# class CompositionRelation(RelationBuilder, BinaryRelation):
-# 	def is_matched_by(self, a, c) -> bool:
-# 		relation_1, relation_2 = self._relations
-# 		a_bs = Relation.get_all_with_value_at_from(a, 0, relation_1.set)
-# 		b_cs = Relation.get_all_with_value_at_from(c, 1, relation_2.set)
-# 		return any((a_b[1] == b_c[0] for a_b, b_c in product(a_bs, b_cs)))
-#
-#
-# class ConverseRelation(RelationBuilder, BinaryRelation):
-#
-# 	def __init__(self, name: str = '', relation=None):
-# 		super().__init__(name, relation)
-#
-# 	def is_matched_by(self, a, b) -> bool:
-# 		return self._relations[0].is_matched_by(b, a)
+	def __invert__(self):
+		return ConverseRelation(name=f'converse_of_{self.name}', relation=self)
+
+
+class CompositionRelation(DerivedRelation, BinaryRelation):
+
+	def __init__(self, name, *, relations: Iterable[Relation], **kwargs):
+		super().__init__(name, relations=relations, params=((0, 1), (1, 2)), **kwargs)
+
+	@classmethod
+	def _predicate(cls, relations: Iterable[Relation], layer: Iterable[tuple]) -> bool:
+		return all((relation(members) for relation, members in zip(relations, layer)))
+
+
+class ConverseRelation(DerivedRelation, BinaryRelation):
+	def __init__(self, name, *, relation: Relation, **kwargs):
+		super().__init__(name, relations=(relation, ), params=(1, 0), **kwargs)
+
+	@classmethod
+	def _predicate(cls, relations: Iterable[Relation], layer: Iterable[tuple]) -> bool:
+		return next(iter(layer)) in next(iter(relations))
 
 
 class RelationStorage:
