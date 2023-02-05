@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from functools import reduce
 from itertools import repeat, product
 from typing import Iterable, Any, Callable
 
 from more_itertools import unique_everseen, bucket
-
+import operator as op
 
 class IName:
 
@@ -105,6 +106,11 @@ class Relation(IName, IIsMatchedBy, ISet, IArity):
 	def __neg__(self) -> DerivedRelation:
 		return ComplementRelation(f'not_{self.name}', relation=self)
 
+	def __eq__(self, other):
+		if not isinstance(other, Relation):
+			return False
+		return self.name == other.name and self.arity == other.arity
+
 
 class DerivedRelation(Relation, ABC):
 	def __init__(self, name, *, relations: Iterable[Relation], params: Iterable[tuple[int | str, ...]] = None, pred: Callable[[Iterable[Relation], Iterable[tuple]], bool] = None, **kwargs):
@@ -194,6 +200,11 @@ class ComplementRelation(DerivedRelation):
 	def _predicate(cls, relations: Iterable[Relation], layer: Iterable[tuple]) -> bool:
 		relation, members = next(iter(relations)), next(iter(layer))
 		return not relation(members)
+
+	def set(self):
+		relation = self._relations[0]
+		rest = (rel.set for rel in Relation._all_relations[relation.arity] if rel != relation)
+		return reduce(op.or_, rest) - relation.set
 
 
 class IInduce(ABC):
