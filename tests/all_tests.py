@@ -2,11 +2,11 @@ import unittest
 
 from tests.abstractTest import AbstractTest
 from tests.basicRelationsTest import BasicRelationsTest
-# from tests.operationsTest import OperationsTest
+from tests.operationsTest import OperationsTest
 
 tests = [
     BasicRelationsTest,
-    # OperationsTest,
+    OperationsTest,
 ]
 
 
