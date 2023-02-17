@@ -3,7 +3,7 @@ from typing import Callable
 from parameterized import parameterized
 
 from src.relations import Relation, BinaryRelation
-from tests.abstractRelationsTest import AbstractRelationsTest
+from tests.AbstractRelationsTest import AbstractRelationsTest
 
 
 class OperationsTest(AbstractRelationsTest):
